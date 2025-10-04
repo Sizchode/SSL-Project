@@ -1,0 +1,68 @@
+#!/bin/bash
+#SBATCH --job-name=mae_grid
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=60G
+#SBATCH --partition=gpu-he
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --array=0
+#SBATCH --time=25:59:59
+#SBATCH --mail-type=begin,end,fail
+#SBATCH --mail-user=zhenkeliu@163.com
+#SBATCH --output=mae_grid%A_%a.out
+#SBATCH --exclude=gpu3001,gpu3002,gpu2704
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate galaxy-mae
+
+export WANDB_ENTITY="sizchode-brown-university"
+export WANDB_PROJECT="ssl"
+
+cd $(dirname "$0")
+
+echo "==== ENV INFO ===="
+echo "Job ID: $SLURM_JOB_ID"
+hostname
+date
+nvidia-smi
+
+# Grid search parameters - keep decoder architecture fixed, vary training settings
+LR_LIST=(3e-4)  
+DEC_LAYERS_LIST=(4)  # Keep fixed at notebook's setting
+MASK_LIST=(0.75)  # Notebook's mask ratio
+NORM_PIX_LOSS_LIST=(true)  # Notebook's setting (false) + alternative (true)
+EPOCHS_LIST=(400)
+COMBINATIONS=()
+for LR in "${LR_LIST[@]}"; do
+  for DECL in "${DEC_LAYERS_LIST[@]}"; do
+      for MASK in "${MASK_LIST[@]}"; do
+          for NORM in "${NORM_PIX_LOSS_LIST[@]}"; do
+              for EPOCHS in "${EPOCHS_LIST[@]}"; do
+              RN="mae_lr${LR}_decl${DECL}_mask${MASK}_norm${NORM}_$(date +%H%M%S)"
+              cmd="--use_wandb --image_size 256 --epochs $EPOCHS --batch_size 512"  # Changed epochs to 800 (notebook's setting)
+              cmd="$cmd --lr $LR --mask_ratio $MASK --hidden_size 384 --num_layers 12"
+              cmd="$cmd --decoder_hidden_size 256 --decoder_num_layers $DECL --num_samples_pdf 2"  # Fixed decoder size to notebook's setting
+              cmd="$cmd --run_name $RN"
+              if [ "$NORM" = "true" ]; then
+                  cmd="$cmd --norm_pix_loss"
+              fi
+              COMBINATIONS+=("$cmd")
+              done
+          done
+      done
+  done
+done
+
+TOTAL=${#COMBINATIONS[@]}
+echo "Total jobs: $TOTAL"
+if [ "$SLURM_ARRAY_TASK_ID" -ge "$TOTAL" ]; then
+  echo "Error: SLURM_ARRAY_TASK_ID ($SLURM_ARRAY_TASK_ID) out of range ($TOTAL)"
+  exit 1
+fi
+
+CMD="${COMBINATIONS[$SLURM_ARRAY_TASK_ID]}"
+echo ">>> Running config: $CMD"
+python main.py $CMD
+STATUS=$?
+echo "Job exited with status $STATUS"
