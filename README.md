@@ -1,6 +1,6 @@
 # MAE Self-Supervised Learning on Galaxy10-DECALS
 
-This repository implements Masked Autoencoder (MAE) self-supervised learning on the Galaxy10-DECALS dataset using Vision Transformers. The project explores MAE pre-training on astronomical galaxy images and evaluates learned representations through comprehensive linear probing and fine-tuning experiments. Pre-trained encoder can be accessed at https://drive.google.com/file/d/1oQ1woMGIf8wXCsmp_DIrCNTUvR1n6JuM/view?usp=sharing
+This repository implements Masked Autoencoder (MAE) self-supervised learning on the Galaxy10-DECALS dataset using Vision Transformers. The project explores MAE pre-training on astronomical galaxy images and evaluates learned representations through comprehensive linear probing and fine-tuning experiments. Pre-trained encoder can be accessed at https://drive.google.com/file/d/1oQ1woMGIf8wXCsmp_DIrCNTUvR1n6JuM/view?usp=sharing. All experiments are run on Oscar.
 
 ## Results
 
