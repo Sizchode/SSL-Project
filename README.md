@@ -9,6 +9,9 @@ This repository implements Masked Autoencoder (MAE) self-supervised learning on 
 - **Full Fine-tuning**: 73.79% accuracy with SSL pre-training
 - **Optimal Mask Ratio**: 0.75 (tested 0.65-0.90 range)
 
+## Reconstruction Example
+![MAE reconstructions]()
+
 ## Environment Setup
 
 ### Option 1: Using Conda (Recommended)
