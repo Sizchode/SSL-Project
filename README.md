@@ -21,7 +21,10 @@ This repository implements Masked Autoencoder (MAE) self-supervised learning on 
 - **Optimal Mask Ratio**: 0.75 (tested 0.65-0.90 range)
 
 ## Reconstruction Example
-![MAE reconstructions](reconstruction_example.png)
+- **without pixel normalization loss
+![MAE reconstruction example](reconstruction_example.png)
+- **using pixel normalization loss
+![MAE reconstruction example](reconstruction_example2.png)
 
 ## Environment Setup
 
