@@ -132,7 +132,7 @@ class MAETrainer(Trainer):
         except StopIteration:
             return
         if batch_key not in batch:
-            print(f"[MyTrainer] batch 中找不到 '{batch_key}'；可视化跳过。")
+            print(f"[MyTrainer] batch key '{batch_key}' not found, skipping visualization.")
             return
         pixel_values = batch[batch_key][image_index].unsqueeze(0)
         self.model.eval()
