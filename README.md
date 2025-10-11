@@ -4,9 +4,9 @@ This repository implements Masked Autoencoder (MAE) self-supervised learning on 
 
 ## Results
 
-- **Best Configuration**: 61.39% accuracy with linear probing (no augmentation)
-- **SSL vs Random**: 61.39% (SSL) vs 54.28% (random fine-tuning)
-- **Full Fine-tuning**: 73.79% accuracy with SSL pre-training
+- **Best Configuration**: 66.23% accuracy with linear probing (no augmentation)
+- **SSL vs Random**: 66.23% (SSL) vs 64.21% (random fine-tuning)
+- **Full Fine-tuning**: 77.51% accuracy with SSL pre-training
 - **Optimal Mask Ratio**: 0.75 (tested 0.65-0.90 range)
 
 ## Reconstruction Example
