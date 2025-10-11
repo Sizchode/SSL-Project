@@ -50,7 +50,7 @@ for LR in "${LR_LIST[@]}"; do
                       else
                           RN="mae_lr${LR}_decl${DECL}_mask${MASK}_norm${NORM}_crop${CROP}_$(date +%H%M%S)"
                       fi
-                      cmd="--use_wandb --image_size 256 --epochs $EPOCHS --batch_size 512"
+                      cmd="--image_size 256 --epochs $EPOCHS --batch_size 512"
                       cmd="$cmd --lr $LR --mask_ratio $MASK --hidden_size 384 --num_layers 12"
                       cmd="$cmd --decoder_hidden_size 256 --decoder_num_layers $DECL --num_samples_pdf 2"
                       cmd="$cmd --run_name $RN"

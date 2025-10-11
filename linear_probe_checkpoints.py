@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Linear probing script for pre-trained MAE encoders.
-Loads checkpoints with different mask ratios and runs linear probing.
-"""
 
 import os
 import argparse
@@ -18,9 +14,7 @@ import wandb
 
 from transformers import ViTConfig, ViTModel
 
-
 class HFWithLabel(torch.utils.data.Dataset):
-    """(x, y) for linear probe; no augmentation for fair comparison."""
     def __init__(self, hf_split, image_size=256, train=True, mean=None, std=None):
         self.split = hf_split
         if mean is not None and std is not None:
@@ -34,10 +28,10 @@ class HFWithLabel(torch.utils.data.Dataset):
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
             ])
-    
-    def __len__(self): 
+
+    def __len__(self):
         return len(self.split)
-    
+
     def __getitem__(self, i):
         r = self.split[i]
         img = r["image"]
@@ -47,91 +41,70 @@ class HFWithLabel(torch.utils.data.Dataset):
         y = int(r["label"])
         return x, y
 
-
 def get_args():
     p = argparse.ArgumentParser(description="Linear probe pre-trained MAE encoders + comprehensive evaluation")
     p.add_argument("--dataset", default="matthieulel/galaxy10_decals", help="HF dataset id")
     p.add_argument("--image_size", type=int, default=256)
     p.add_argument("--out_dir", default="outputs", help="where to save results")
     p.add_argument("--seed", type=int, default=42)
-    
-    # Linear probe parameters
     p.add_argument("--probe_epochs", type=int, default=90, help="Linear probe epochs")
     p.add_argument("--probe_lr", type=float, default=1e-3, help="Linear probe learning rate")
     p.add_argument("--probe_wd", type=float, default=1e-4, help="Linear probe weight decay")
     p.add_argument("--batch_size", type=int, default=64, help="Linear probe batch size")
-    
-    # Comprehensive evaluation parameters
     p.add_argument("--comprehensive_eval", action="store_true", help="Run comprehensive evaluation")
-    p.add_argument("--experiment", type=str, default="all", 
+    p.add_argument("--experiment", type=str, default="all",
                    choices=["all", "zero_random_probe", "ssl_probe", "random_ft", "ssl_ft"],
                    help="Which experiment to run (for parallel execution)")
-    p.add_argument("--ssl_checkpoint", 
+    p.add_argument("--ssl_checkpoint",
                    default="./outputs/mae_lr3e-4_decl4_mask0.75_normfalse_172129/encoder.pth",
                    help="Path to SSL pretrained encoder for comprehensive eval")
     p.add_argument("--finetune_epochs", type=int, default=90, help="Full fine-tuning epochs")
     p.add_argument("--finetune_lr", type=float, default=1e-3, help="Full fine-tuning learning rate")
     p.add_argument("--finetune_batch_size", type=int, default=512, help="Fine-tuning batch size per step")
     p.add_argument("--finetune_grad_accum", type=int, default=4, help="Gradient accumulation steps for fine-tuning")
-    
-    # Wandb arguments
     p.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
     p.add_argument("--project", default="ssl-linear-probe", help="Wandb project name")
-    
+
     return p.parse_args()
 
-
-
-
-
 def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoint_name):
-    """Run linear probing on the encoder."""
     print(f"\n[probe] Starting linear probe for {checkpoint_name}")
     print(f"  Epochs: {args.probe_epochs}, LR: {args.probe_lr}, WD: {args.probe_wd}")
-    
-    # Get number of classes
-    NUM_CLASSES = 10  # Galaxy10 has 10 classes
-    
-    # Linear head
-    head = nn.Linear(384, NUM_CLASSES).to(device)  # 384 is hidden_size
+    NUM_CLASSES = 10
+    head = nn.Linear(384, NUM_CLASSES).to(device)
     ce = nn.CrossEntropyLoss()
     opt_h = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_wd)
-    
-    # Learning rate scheduler (cosine annealing, matching MAE paper)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_h, T_max=args.probe_epochs, eta_min=0)
-    
-    def _cls_readout(last_hidden):  # (B, N, D) -> (B, D)
-        return last_hidden.mean(dim=1)  # Mean pooling over all tokens (MAE has no CLS token)
-    
+
+    def _cls_readout(last_hidden):
+        return last_hidden.mean(dim=1)
+
     best_acc = 0.0
     results = []
     patience_counter = 0
-    early_stop_patience = 30  # Stop if no improvement for 30 epochs
-    
+    early_stop_patience = 30
+
     for ep in range(1, args.probe_epochs + 1):
-        # ---- train head ----
         head.train()
         running_loss, seen = 0.0, 0
         for x, y in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             opt_h.zero_grad(set_to_none=True)
-            
+
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 with torch.no_grad():
                     feats = _cls_readout(encoder(pixel_values=x).last_hidden_state).float()
                 logits = head(feats)
                 loss = ce(logits, y)
-            
+
             loss.backward()
             opt_h.step()
             b = x.size(0)
             running_loss += loss.item() * b
             seen += b
-        
+
         train_loss = running_loss / max(1, seen)
-        
-        # ---- eval ----
         head.eval()
         correct, count = 0, 0
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -143,24 +116,21 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
                 pred = logits.argmax(dim=1)
                 correct += (pred == y).sum().item()
                 count += y.numel()
-        
+
         acc = correct / max(1, count)
-        
-        # Check for improvement
         if acc > best_acc:
             best_acc = acc
             patience_counter = 0
         else:
             patience_counter += 1
-        
-        # Update learning rate scheduler (cosine annealing)
+
         scheduler.step()
         current_lr = opt_h.param_groups[0]['lr']
-        
+
         print(f"[probe] {checkpoint_name} | epoch {ep:03d}/{args.probe_epochs} | "
               f"train_loss={train_loss:.4f} | test_acc={acc*100:.2f}% (best {best_acc*100:.2f}%) | "
               f"lr={current_lr:.2e} | patience={patience_counter}")
-        
+
         results.append({
             'epoch': ep,
             'train_loss': train_loss,
@@ -168,8 +138,7 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
             'best_acc': best_acc,
             'learning_rate': current_lr
         })
-        
-        # Log to wandb if enabled
+
         if args.use_wandb:
             wandb.log({
                 f"probe/{checkpoint_name}/epoch": ep,
@@ -178,19 +147,16 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
                 f"probe/{checkpoint_name}/best_acc": best_acc,
                 f"probe/{checkpoint_name}/learning_rate": current_lr
             }, step=ep)
-        
-        # Early stopping
+
         if patience_counter >= early_stop_patience:
             print(f"[probe] {checkpoint_name} | Early stopping at epoch {ep} (no improvement for {early_stop_patience} epochs)")
             break
-    
+
     print(f"[probe] {checkpoint_name} | Final best test acc: {best_acc*100:.2f}%")
     return best_acc, results
 
-
 def create_vit_model(device, pretrained_weights=None):
-    """Create ViT model - either random or load pretrained weights."""
-    # Create encoder config (matching the pre-training config)
+    
     enc_cfg = ViTConfig(
         image_size=256,
         patch_size=16,
@@ -201,10 +167,9 @@ def create_vit_model(device, pretrained_weights=None):
         intermediate_size=384 * 4,
         qkv_bias=True,
     )
-    
-    # Create encoder model
+
     encoder = ViTModel(enc_cfg).to(device)
-    
+
     if pretrained_weights is not None:
         print(f"[load] Loading pretrained weights from: {pretrained_weights}")
         sd = torch.load(pretrained_weights, map_location="cpu")
@@ -213,81 +178,69 @@ def create_vit_model(device, pretrained_weights=None):
             print(f"[load] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
     else:
         print("[load] Using randomly initialized ViT")
-    
+
     return encoder
 
-
 def run_full_finetuning(encoder, train_dataset, test_loader, args, device, experiment_name):
-    """Run full fine-tuning (unfrozen backbone + classification head)."""
-    print(f"\n[finetune] Starting full fine-tuning for {experiment_name}")
     
-    # Use specified gradient accumulation and batch size for fine-tuning
+    print(f"\n[finetune] Starting full fine-tuning for {experiment_name}")
+
     gradient_accumulation_steps = args.finetune_grad_accum
     effective_batch_size = args.finetune_batch_size * gradient_accumulation_steps
     print(f"[finetune] Batch size: {args.finetune_batch_size}, Grad accum: {gradient_accumulation_steps}, Effective batch: {effective_batch_size}")
-    
-    # Create fine-tuning dataloader with smaller batch size
+
     train_loader_ft = DataLoader(
         train_dataset, batch_size=args.finetune_batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=False
     )
-    
-    # Unfreeze encoder
+
     for p in encoder.parameters():
         p.requires_grad_(True)
     encoder.train()
-    
-    # Get number of classes
-    NUM_CLASSES = 10  # Galaxy10 has 10 classes
-    
-    # Classification head
+
+    NUM_CLASSES = 10
+
     head = nn.Linear(384, NUM_CLASSES).to(device)
     ce = nn.CrossEntropyLoss()
-    
-    # Optimizer for both encoder and head
+
     all_params = list(encoder.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(all_params, lr=args.finetune_lr, weight_decay=args.probe_wd)
-    
-    # Learning rate scheduler (cosine annealing, matching MAE paper)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.finetune_epochs, eta_min=0)
-    
-    def _cls_readout(last_hidden):  # (B, N, D) -> (B, D)
-        return last_hidden.mean(dim=1)  # Mean pooling over all tokens
-    
+
+    def _cls_readout(last_hidden):
+        return last_hidden.mean(dim=1)
+
     best_acc = 0.0
     patience_counter = 0
     early_stop_patience = 30
-    
+
     for ep in range(1, args.finetune_epochs + 1):
-        # ---- train ----
         encoder.train()
         head.train()
         running_loss, seen = 0.0, 0
         for batch_idx, (x, y) in enumerate(train_loader_ft):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            
+
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 feats = _cls_readout(encoder(pixel_values=x).last_hidden_state).float()
                 logits = head(feats)
                 loss = ce(logits, y)
-                # Scale loss for gradient accumulation
                 loss = loss / gradient_accumulation_steps
-            
+
             loss.backward()
-            
-            # Update weights only after accumulating gradients
+
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
-            
+
             b = x.size(0)
-            running_loss += loss.item() * b * gradient_accumulation_steps  # Unscale for logging
+            running_loss += loss.item() * b * gradient_accumulation_steps
             seen += b
-        
+
         train_loss = running_loss / max(1, seen)
-        
-        # ---- eval ----
+
         encoder.eval()
         head.eval()
         correct, count = 0, 0
@@ -300,24 +253,21 @@ def run_full_finetuning(encoder, train_dataset, test_loader, args, device, exper
                 pred = logits.argmax(dim=1)
                 correct += (pred == y).sum().item()
                 count += y.numel()
-        
+
         acc = correct / max(1, count)
-        
-        # Check for improvement
         if acc > best_acc:
             best_acc = acc
             patience_counter = 0
         else:
             patience_counter += 1
-        
+
         scheduler.step()
         current_lr = opt.param_groups[0]['lr']
-        
+
         print(f"[finetune] {experiment_name} | epoch {ep:03d}/{args.finetune_epochs} | "
               f"train_loss={train_loss:.4f} | test_acc={acc*100:.2f}% (best {best_acc*100:.2f}%) | "
               f"lr={current_lr:.2e} | patience={patience_counter}")
-        
-        # Log to wandb if enabled
+
         if args.use_wandb:
             wandb.log({
                 f"finetune/{experiment_name}/epoch": ep,
@@ -326,56 +276,49 @@ def run_full_finetuning(encoder, train_dataset, test_loader, args, device, exper
                 f"finetune/{experiment_name}/best_acc": best_acc,
                 f"finetune/{experiment_name}/learning_rate": current_lr
             }, step=ep)
-        
-        # Early stopping
+
         if patience_counter >= early_stop_patience:
             print(f"[finetune] {experiment_name} | Early stopping at epoch {ep}")
             break
-    
+
     print(f"[finetune] {experiment_name} | Final best test acc: {best_acc*100:.2f}%")
     return best_acc
 
-
 def run_zero_shot_evaluation(encoder, test_loader, device, experiment_name):
-    """Run zero-shot evaluation (no training, just random predictions)."""
-    print(f"\n[zeroshot] Starting zero-shot evaluation for {experiment_name}")
     
+    print(f"\n[zeroshot] Starting zero-shot evaluation for {experiment_name}")
+
     encoder.eval()
     correct, count = 0, 0
-    
+
     with torch.no_grad():
         for x, y in test_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            
-            # Random predictions (10 classes)
+
             pred = torch.randint(0, 10, (y.size(0),), device=device)
             correct += (pred == y).sum().item()
             count += y.numel()
-    
+
     acc = correct / max(1, count)
     print(f"[zeroshot] {experiment_name} | Zero-shot test acc: {acc*100:.2f}%")
-    
-    return acc
 
+    return acc
 
 def main():
     args = get_args()
-    
-    # Set seed
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    
-    # Initialize wandb if requested
+
     if args.use_wandb:
-        # Create unique run name based on experiment
         if args.comprehensive_eval:
             run_name = f"linear-probe-{args.experiment}"
         else:
             run_name = "linear-probe-mask-comparison"
-        
+
         wandb.init(
             project=args.project,
             entity="sizchode-brown-university",
@@ -383,28 +326,24 @@ def main():
             config=vars(args),
             settings=wandb.Settings(start_method="fork")
         )
-    
-    # Device
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[info] Using device: {device}")
-    
-    # Load dataset
+
     print(f"[info] Loading dataset: {args.dataset}")
     ds = load_dataset(args.dataset)
     train_split, test_split = ds["train"], ds["test"]
     print(f"[info] Splits -> train: {len(train_split)} | test: {len(test_split)}")
-    
-    # Hardcoded ImageNet normalization statistics
+
     dataset_mean = [0.485, 0.456, 0.406]
     dataset_std = [0.229, 0.224, 0.225]
     print(f"[info] Using ImageNet statistics: mean={dataset_mean}, std={dataset_std}")
-    
-    # Create data loaders
-    train_sup = HFWithLabel(train_split, image_size=args.image_size, train=True, 
+
+    train_sup = HFWithLabel(train_split, image_size=args.image_size, train=True,
                            mean=dataset_mean, std=dataset_std)
-    test_sup = HFWithLabel(test_split, image_size=args.image_size, train=False, 
+    test_sup = HFWithLabel(test_split, image_size=args.image_size, train=False,
                           mean=dataset_mean, std=dataset_std)
-    
+
     train_loader = DataLoader(
         train_sup, batch_size=args.batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=False
@@ -413,18 +352,15 @@ def main():
         test_sup, batch_size=args.batch_size, shuffle=False,
         num_workers=4, pin_memory=True, drop_last=False
     )
-    
+
     if args.comprehensive_eval:
-        # Comprehensive evaluation: Random vs SSL
         print("\n" + "="*80)
         print(f"COMPREHENSIVE EVALUATION: {args.experiment.upper()}")
         print("="*80)
-        
+
         results = {}
-        
-        # Run selected experiments
+
         if args.experiment in ["all", "zero_random_probe"]:
-            # 1. Random ViT - Zero-shot
             print("\n1. RANDOM ViT - ZERO-SHOT EVALUATION")
             print("-" * 50)
             random_encoder = create_vit_model(device, pretrained_weights=None)
@@ -432,8 +368,7 @@ def main():
             results["random_vit_zeroshot"] = zero_shot_acc
             del random_encoder
             torch.cuda.empty_cache()
-            
-            # 2. Random ViT - Linear Probe
+
             print("\n2. RANDOM ViT - LINEAR PROBE")
             print("-" * 50)
             random_encoder = create_vit_model(device, pretrained_weights=None)
@@ -441,9 +376,8 @@ def main():
             results["random_vit_probe"] = random_probe_acc
             del random_encoder
             torch.cuda.empty_cache()
-        
+
         if args.experiment in ["all", "ssl_probe"]:
-            # 3. SSL Pretrained - Linear Probe
             print("\n3. SSL PRETRAINED - LINEAR PROBE")
             print("-" * 50)
             if os.path.exists(args.ssl_checkpoint):
@@ -455,9 +389,8 @@ def main():
             else:
                 print(f"[warning] SSL checkpoint not found: {args.ssl_checkpoint}")
                 results["ssl_pretrained_probe"] = 0.0
-        
+
         if args.experiment in ["all", "random_ft"]:
-            # 4. Random ViT - Full Fine-tuning
             print("\n4. RANDOM ViT - FULL FINE-TUNING")
             print("-" * 50)
             random_encoder = create_vit_model(device, pretrained_weights=None)
@@ -465,9 +398,8 @@ def main():
             results["random_vit_finetune"] = random_ft_acc
             del random_encoder
             torch.cuda.empty_cache()
-        
+
         if args.experiment in ["all", "ssl_ft"]:
-            # 5. SSL Pretrained - Full Fine-tuning
             print("\n5. SSL PRETRAINED - FULL FINE-TUNING")
             print("-" * 50)
             if os.path.exists(args.ssl_checkpoint):
@@ -479,25 +411,22 @@ def main():
             else:
                 print(f"[warning] SSL checkpoint not found: {args.ssl_checkpoint}")
                 results["ssl_pretrained_finetune"] = 0.0
-        
-        # Print results summary
+
         print("\n" + "="*80)
         print(f"EVALUATION RESULTS: {args.experiment.upper()}")
         print("="*80)
         print(f"{'Experiment':<30s} {'Accuracy':<10s}")
         print("-" * 80)
-        
+
         for exp_name, acc in results.items():
             print(f"{exp_name:<30s} {acc*100:>8.2f}%")
-        
+
         print("="*80)
-        
-        # Log to wandb
+
         if args.use_wandb:
             log_dict = {f"summary/{k}": v for k, v in results.items()}
             wandb.log(log_dict)
             wandb.finish()
-    
 
 if __name__ == "__main__":
     main()

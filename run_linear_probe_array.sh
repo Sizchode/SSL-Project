@@ -47,7 +47,6 @@ echo "================================================"
 python linear_probe_checkpoints.py \
     --comprehensive_eval \
     --experiment $EXPERIMENT \
-    --use_wandb \
     --probe_epochs 90 \
     --probe_lr 1e-3 \
     --probe_wd 1e-4 \
