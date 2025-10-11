@@ -28,22 +28,9 @@ This repository implements Masked Autoencoder (MAE) self-supervised learning on 
 
 ## Environment Setup
 
-### Option 1: Using Conda (Recommended)
+### Installation
 
 ```bash
-# Create environment from environment.yml
-conda env create -f environment.yml
-conda activate galaxy-mae
-```
-
-### Option 2: Using pip
-
-```bash
-# Create virtual environment
-python -m venv galaxy-mae
-source galaxy-mae/bin/activate  # On Windows: galaxy-mae\Scripts\activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
