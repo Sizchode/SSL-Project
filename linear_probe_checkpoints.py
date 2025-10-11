@@ -16,14 +16,13 @@ from datasets import load_dataset
 from PIL import Image
 import wandb
 
-from transformers import ViTMAEConfig, ViTMAEModel, ViTImageProcessor
+from transformers import ViTConfig, ViTModel
 
 
 class HFWithLabel(torch.utils.data.Dataset):
     """(x, y) for linear probe; no augmentation for fair comparison."""
     def __init__(self, hf_split, image_size=256, train=True, mean=None, std=None):
         self.split = hf_split
-        # No augmentation for both train and test to ensure fair comparison
         if mean is not None and std is not None:
             self.tx = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
@@ -64,11 +63,16 @@ def get_args():
     
     # Comprehensive evaluation parameters
     p.add_argument("--comprehensive_eval", action="store_true", help="Run comprehensive evaluation")
+    p.add_argument("--experiment", type=str, default="all", 
+                   choices=["all", "zero_random_probe", "ssl_probe", "random_ft", "ssl_ft"],
+                   help="Which experiment to run (for parallel execution)")
     p.add_argument("--ssl_checkpoint", 
-                   default="/users/zliu328/ssl/outputs/mae_lr3e-4_decl4_mask0.75_normfalse_210133/encoder.pth",
+                   default="./outputs/mae_lr3e-4_decl4_mask0.75_normfalse_172129/encoder.pth",
                    help="Path to SSL pretrained encoder for comprehensive eval")
     p.add_argument("--finetune_epochs", type=int, default=90, help="Full fine-tuning epochs")
     p.add_argument("--finetune_lr", type=float, default=1e-3, help="Full fine-tuning learning rate")
+    p.add_argument("--finetune_batch_size", type=int, default=512, help="Fine-tuning batch size per step")
+    p.add_argument("--finetune_grad_accum", type=int, default=4, help="Gradient accumulation steps for fine-tuning")
     
     # Wandb arguments
     p.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
@@ -77,46 +81,7 @@ def get_args():
     return p.parse_args()
 
 
-def load_encoder_from_checkpoint(checkpoint_path, device):
-    """Load encoder from checkpoint with proper configuration."""
-    print(f"[load] Loading encoder from: {checkpoint_path}")
-    
-    # Load the checkpoint to get the config
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    
-    # Create encoder config (matching the pre-training config)
-    enc_cfg = ViTMAEConfig(
-        image_size=256,
-        patch_size=16,  # Fixed to match pre-training
-        num_channels=3,
-        hidden_size=384,
-        num_hidden_layers=12,
-        num_attention_heads=6,
-        intermediate_size=384 * 4,
-        qkv_bias=True,
-    )
-    
-    # Create encoder model
-    encoder = ViTMAEModel(enc_cfg).to(device)
-    
-    # Load state dict
-    sd = torch.load(checkpoint_path, map_location="cpu")
-    missing, unexpected = encoder.load_state_dict(sd, strict=False)
-    
-    if missing or unexpected:
-        print(f"[load] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
-        if missing:
-            print(f"  Missing keys: {missing[:5]}...")  # Show first 5
-        if unexpected:
-            print(f"  Unexpected keys: {unexpected[:5]}...")  # Show first 5
-    
-    # Freeze encoder
-    for p in encoder.parameters():
-        p.requires_grad_(False)
-    encoder.eval()
-    
-    print(f"[load] Encoder loaded successfully")
-    return encoder
+
 
 
 def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoint_name):
@@ -132,10 +97,8 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
     ce = nn.CrossEntropyLoss()
     opt_h = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_wd)
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt_h, mode='max', factor=0.5, patience=5, verbose=True, min_lr=1e-6
-    )
+    # Learning rate scheduler (cosine annealing, matching MAE paper)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_h, T_max=args.probe_epochs, eta_min=0)
     
     def _cls_readout(last_hidden):  # (B, N, D) -> (B, D)
         return last_hidden.mean(dim=1)  # Mean pooling over all tokens (MAE has no CLS token)
@@ -143,7 +106,7 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
     best_acc = 0.0
     results = []
     patience_counter = 0
-    early_stop_patience = 30  # Stop if no improvement for 15 epochs
+    early_stop_patience = 30  # Stop if no improvement for 30 epochs
     
     for ep in range(1, args.probe_epochs + 1):
         # ---- train head ----
@@ -190,8 +153,8 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
         else:
             patience_counter += 1
         
-        # Update learning rate scheduler
-        scheduler.step(acc)
+        # Update learning rate scheduler (cosine annealing)
+        scheduler.step()
         current_lr = opt_h.param_groups[0]['lr']
         
         print(f"[probe] {checkpoint_name} | epoch {ep:03d}/{args.probe_epochs} | "
@@ -228,7 +191,7 @@ def run_linear_probe(encoder, train_loader, test_loader, args, device, checkpoin
 def create_vit_model(device, pretrained_weights=None):
     """Create ViT model - either random or load pretrained weights."""
     # Create encoder config (matching the pre-training config)
-    enc_cfg = ViTMAEConfig(
+    enc_cfg = ViTConfig(
         image_size=256,
         patch_size=16,
         num_channels=3,
@@ -240,7 +203,7 @@ def create_vit_model(device, pretrained_weights=None):
     )
     
     # Create encoder model
-    encoder = ViTMAEModel(enc_cfg).to(device)
+    encoder = ViTModel(enc_cfg).to(device)
     
     if pretrained_weights is not None:
         print(f"[load] Loading pretrained weights from: {pretrained_weights}")
@@ -254,9 +217,20 @@ def create_vit_model(device, pretrained_weights=None):
     return encoder
 
 
-def run_full_finetuning(encoder, train_loader, test_loader, args, device, experiment_name):
+def run_full_finetuning(encoder, train_dataset, test_loader, args, device, experiment_name):
     """Run full fine-tuning (unfrozen backbone + classification head)."""
     print(f"\n[finetune] Starting full fine-tuning for {experiment_name}")
+    
+    # Use specified gradient accumulation and batch size for fine-tuning
+    gradient_accumulation_steps = args.finetune_grad_accum
+    effective_batch_size = args.finetune_batch_size * gradient_accumulation_steps
+    print(f"[finetune] Batch size: {args.finetune_batch_size}, Grad accum: {gradient_accumulation_steps}, Effective batch: {effective_batch_size}")
+    
+    # Create fine-tuning dataloader with smaller batch size
+    train_loader_ft = DataLoader(
+        train_dataset, batch_size=args.finetune_batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=False
+    )
     
     # Unfreeze encoder
     for p in encoder.parameters():
@@ -274,37 +248,41 @@ def run_full_finetuning(encoder, train_loader, test_loader, args, device, experi
     all_params = list(encoder.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(all_params, lr=args.finetune_lr, weight_decay=args.probe_wd)
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='max', factor=0.5, patience=5, verbose=True, min_lr=1e-6
-    )
+    # Learning rate scheduler (cosine annealing, matching MAE paper)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.finetune_epochs, eta_min=0)
     
     def _cls_readout(last_hidden):  # (B, N, D) -> (B, D)
         return last_hidden.mean(dim=1)  # Mean pooling over all tokens
     
     best_acc = 0.0
     patience_counter = 0
-    early_stop_patience = 15
+    early_stop_patience = 30
     
     for ep in range(1, args.finetune_epochs + 1):
         # ---- train ----
         encoder.train()
         head.train()
         running_loss, seen = 0.0, 0
-        for x, y in train_loader:
+        for batch_idx, (x, y) in enumerate(train_loader_ft):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
             
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 feats = _cls_readout(encoder(pixel_values=x).last_hidden_state).float()
                 logits = head(feats)
                 loss = ce(logits, y)
+                # Scale loss for gradient accumulation
+                loss = loss / gradient_accumulation_steps
             
             loss.backward()
-            opt.step()
+            
+            # Update weights only after accumulating gradients
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            
             b = x.size(0)
-            running_loss += loss.item() * b
+            running_loss += loss.item() * b * gradient_accumulation_steps  # Unscale for logging
             seen += b
         
         train_loss = running_loss / max(1, seen)
@@ -332,7 +310,7 @@ def run_full_finetuning(encoder, train_loader, test_loader, args, device, experi
         else:
             patience_counter += 1
         
-        scheduler.step(acc)
+        scheduler.step()
         current_lr = opt.param_groups[0]['lr']
         
         print(f"[finetune] {experiment_name} | epoch {ep:03d}/{args.finetune_epochs} | "
@@ -392,10 +370,16 @@ def main():
     
     # Initialize wandb if requested
     if args.use_wandb:
+        # Create unique run name based on experiment
+        if args.comprehensive_eval:
+            run_name = f"linear-probe-{args.experiment}"
+        else:
+            run_name = "linear-probe-mask-comparison"
+        
         wandb.init(
             project=args.project,
             entity="sizchode-brown-university",
-            name="linear-probe-mask-comparison",
+            name=run_name,
             config=vars(args),
             settings=wandb.Settings(start_method="fork")
         )
@@ -410,10 +394,9 @@ def main():
     train_split, test_split = ds["train"], ds["test"]
     print(f"[info] Splits -> train: {len(train_split)} | test: {len(test_split)}")
     
-    # Use pre-trained processor statistics
-    processor = ViTImageProcessor.from_pretrained("facebook/vit-mae-base")
-    dataset_mean = processor.image_mean
-    dataset_std = processor.image_std
+    # Hardcoded ImageNet normalization statistics
+    dataset_mean = [0.485, 0.456, 0.406]
+    dataset_std = [0.229, 0.224, 0.225]
     print(f"[info] Using ImageNet statistics: mean={dataset_mean}, std={dataset_std}")
     
     # Create data loaders
@@ -434,140 +417,87 @@ def main():
     if args.comprehensive_eval:
         # Comprehensive evaluation: Random vs SSL
         print("\n" + "="*80)
-        print("COMPREHENSIVE EVALUATION: RANDOM vs SSL")
+        print(f"COMPREHENSIVE EVALUATION: {args.experiment.upper()}")
         print("="*80)
         
         results = {}
         
-        # 1. Random ViT - Zero-shot
-        print("\n1. RANDOM ViT - ZERO-SHOT EVALUATION")
-        print("-" * 50)
-        random_encoder = create_vit_model(device, pretrained_weights=None)
-        zero_shot_acc = run_zero_shot_evaluation(random_encoder, test_loader, device, "random_vit")
-        results["random_vit_zeroshot"] = zero_shot_acc
-        del random_encoder
-        torch.cuda.empty_cache()
-        
-        # 2. Random ViT - Full Fine-tuning
-        print("\n2. RANDOM ViT - FULL FINE-TUNING")
-        print("-" * 50)
-        random_encoder = create_vit_model(device, pretrained_weights=None)
-        random_ft_acc = run_full_finetuning(random_encoder, train_loader, test_loader, args, device, "random_vit")
-        results["random_vit_finetune"] = random_ft_acc
-        del random_encoder
-        torch.cuda.empty_cache()
-        
-        # 3. SSL Pretrained - Linear Probe
-        print("\n3. SSL PRETRAINED - LINEAR PROBE")
-        print("-" * 50)
-        if os.path.exists(args.ssl_checkpoint):
-            ssl_encoder = create_vit_model(device, pretrained_weights=args.ssl_checkpoint)
-            ssl_probe_acc, _ = run_linear_probe(ssl_encoder, train_loader, test_loader, args, device, "ssl_pretrained")
-            results["ssl_pretrained_probe"] = ssl_probe_acc
-            del ssl_encoder
+        # Run selected experiments
+        if args.experiment in ["all", "zero_random_probe"]:
+            # 1. Random ViT - Zero-shot
+            print("\n1. RANDOM ViT - ZERO-SHOT EVALUATION")
+            print("-" * 50)
+            random_encoder = create_vit_model(device, pretrained_weights=None)
+            zero_shot_acc = run_zero_shot_evaluation(random_encoder, test_loader, device, "random_vit")
+            results["random_vit_zeroshot"] = zero_shot_acc
+            del random_encoder
             torch.cuda.empty_cache()
-        else:
-            print(f"[warning] SSL checkpoint not found: {args.ssl_checkpoint}")
-            results["ssl_pretrained_probe"] = 0.0
-        
-        # 4. SSL Pretrained - Full Fine-tuning
-        print("\n4. SSL PRETRAINED - FULL FINE-TUNING")
-        print("-" * 50)
-        if os.path.exists(args.ssl_checkpoint):
-            ssl_encoder = create_vit_model(device, pretrained_weights=args.ssl_checkpoint)
-            ssl_ft_acc = run_full_finetuning(ssl_encoder, train_loader, test_loader, args, device, "ssl_pretrained")
-            results["ssl_pretrained_finetune"] = ssl_ft_acc
-            del ssl_encoder
+            
+            # 2. Random ViT - Linear Probe
+            print("\n2. RANDOM ViT - LINEAR PROBE")
+            print("-" * 50)
+            random_encoder = create_vit_model(device, pretrained_weights=None)
+            random_probe_acc, _ = run_linear_probe(random_encoder, train_loader, test_loader, args, device, "random_vit")
+            results["random_vit_probe"] = random_probe_acc
+            del random_encoder
             torch.cuda.empty_cache()
-        else:
-            print(f"[warning] SSL checkpoint not found: {args.ssl_checkpoint}")
-            results["ssl_pretrained_finetune"] = 0.0
         
-        # Print comprehensive summary
+        if args.experiment in ["all", "ssl_probe"]:
+            # 3. SSL Pretrained - Linear Probe
+            print("\n3. SSL PRETRAINED - LINEAR PROBE")
+            print("-" * 50)
+            if os.path.exists(args.ssl_checkpoint):
+                ssl_encoder = create_vit_model(device, pretrained_weights=args.ssl_checkpoint)
+                ssl_probe_acc, _ = run_linear_probe(ssl_encoder, train_loader, test_loader, args, device, "ssl_pretrained")
+                results["ssl_pretrained_probe"] = ssl_probe_acc
+                del ssl_encoder
+                torch.cuda.empty_cache()
+            else:
+                print(f"[warning] SSL checkpoint not found: {args.ssl_checkpoint}")
+                results["ssl_pretrained_probe"] = 0.0
+        
+        if args.experiment in ["all", "random_ft"]:
+            # 4. Random ViT - Full Fine-tuning
+            print("\n4. RANDOM ViT - FULL FINE-TUNING")
+            print("-" * 50)
+            random_encoder = create_vit_model(device, pretrained_weights=None)
+            random_ft_acc = run_full_finetuning(random_encoder, train_sup, test_loader, args, device, "random_vit")
+            results["random_vit_finetune"] = random_ft_acc
+            del random_encoder
+            torch.cuda.empty_cache()
+        
+        if args.experiment in ["all", "ssl_ft"]:
+            # 5. SSL Pretrained - Full Fine-tuning
+            print("\n5. SSL PRETRAINED - FULL FINE-TUNING")
+            print("-" * 50)
+            if os.path.exists(args.ssl_checkpoint):
+                ssl_encoder = create_vit_model(device, pretrained_weights=args.ssl_checkpoint)
+                ssl_ft_acc = run_full_finetuning(ssl_encoder, train_sup, test_loader, args, device, "ssl_pretrained")
+                results["ssl_pretrained_finetune"] = ssl_ft_acc
+                del ssl_encoder
+                torch.cuda.empty_cache()
+            else:
+                print(f"[warning] SSL checkpoint not found: {args.ssl_checkpoint}")
+                results["ssl_pretrained_finetune"] = 0.0
+        
+        # Print results summary
         print("\n" + "="*80)
-        print("COMPREHENSIVE EVALUATION RESULTS SUMMARY")
+        print(f"EVALUATION RESULTS: {args.experiment.upper()}")
         print("="*80)
-        print(f"{'Experiment':<30s} {'Accuracy':<10s} {'Improvement':<15s}")
+        print(f"{'Experiment':<30s} {'Accuracy':<10s}")
         print("-" * 80)
         
-        baseline = results["random_vit_zeroshot"]
         for exp_name, acc in results.items():
-            improvement = f"+{(acc-baseline)*100:.1f}%" if acc > baseline else f"{(acc-baseline)*100:.1f}%"
-            print(f"{exp_name:<30s} {acc*100:>8.2f}% {improvement:>12s}")
+            print(f"{exp_name:<30s} {acc*100:>8.2f}%")
         
-        print("-" * 80)
-        print(f"Random baseline (10 classes): {baseline*100:.2f}%")
-        print(f"Best result: {max(results.values())*100:.2f}%")
         print("="*80)
         
-        # Log summary to wandb
+        # Log to wandb
         if args.use_wandb:
-            wandb.log({
-                "summary/random_vit_zeroshot": results["random_vit_zeroshot"],
-                "summary/random_vit_finetune": results["random_vit_finetune"],
-                "summary/ssl_pretrained_probe": results["ssl_pretrained_probe"],
-                "summary/ssl_pretrained_finetune": results["ssl_pretrained_finetune"],
-                "summary/best_result": max(results.values()),
-                "summary/ssl_improvement": results["ssl_pretrained_probe"] - results["random_vit_zeroshot"],
-            })
+            log_dict = {f"summary/{k}": v for k, v in results.items()}
+            wandb.log(log_dict)
             wandb.finish()
     
-    else:
-        # Original linear probe evaluation
-        # Define checkpoints to test
-        checkpoints = [
-            ("mask0.6_normfalse", "/users/zliu328/ssl/outputs/mae_lr1e-3_decl2_mask0.6_normfalse_184253/encoder.pth"),
-            ("mask0.6_normtrue", "/users/zliu328/ssl/outputs/mae_lr1e-3_decl2_mask0.6_normtrue_184253/encoder.pth"),
-            ("mask0.75_normfalse", "/users/zliu328/ssl/outputs/mae_lr1e-3_decl2_mask0.75_normfalse_184253/encoder.pth"),
-            ("mask0.75_normtrue", "/users/zliu328/ssl/outputs/mae_lr1e-3_decl2_mask0.75_normtrue_184253/encoder.pth"),
-        ]
-        
-        # Run linear probing on each checkpoint
-        results_summary = {}
-        
-        for checkpoint_name, checkpoint_path in checkpoints:
-            if not os.path.exists(checkpoint_path):
-                print(f"[warning] Checkpoint not found: {checkpoint_path}")
-                continue
-            
-            try:
-                # Load encoder
-                encoder = load_encoder_from_checkpoint(checkpoint_path, device)
-                
-                # Run linear probe
-                best_acc, results = run_linear_probe(
-                    encoder, train_loader, test_loader, args, device, checkpoint_name
-                )
-                
-                results_summary[checkpoint_name] = best_acc
-                
-                # Clean up
-                del encoder
-                torch.cuda.empty_cache()
-                
-            except Exception as e:
-                print(f"[error] Failed to run linear probe for {checkpoint_name}: {e}")
-                continue
-        
-        # Print summary
-        print("\n" + "="*60)
-        print("LINEAR PROBE RESULTS SUMMARY")
-        print("="*60)
-        for checkpoint_name, best_acc in results_summary.items():
-            print(f"{checkpoint_name:20s}: {best_acc*100:.2f}%")
-        
-        # Log summary to wandb
-        if args.use_wandb:
-            wandb.log({
-                "summary/mask0.6_normfalse": results_summary.get("mask0.6_normfalse", 0),
-                "summary/mask0.6_normtrue": results_summary.get("mask0.6_normtrue", 0),
-                "summary/mask0.75_normfalse": results_summary.get("mask0.75_normfalse", 0),
-                "summary/mask0.75_normtrue": results_summary.get("mask0.75_normtrue", 0),
-            })
-            wandb.finish()
-        
-        print("="*60)
-
 
 if __name__ == "__main__":
     main()

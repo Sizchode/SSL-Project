@@ -6,7 +6,7 @@
 #SBATCH --mem=60G
 #SBATCH --partition=gpu-he
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --array=0
+#SBATCH --array=0-1
 #SBATCH --time=25:59:59
 #SBATCH --mail-type=begin,end,fail
 #SBATCH --mail-user=zhenkeliu@163.com
@@ -19,35 +19,52 @@ conda activate galaxy-mae
 export WANDB_ENTITY="sizchode-brown-university"
 export WANDB_PROJECT="ssl"
 
-cd $(dirname "$0")
+# Ensure we're in the correct directory
+cd /oscar/home/zliu328/SSL-Project || cd ~/SSL-Project || cd $(dirname "$0")
 
 echo "==== ENV INFO ===="
 echo "Job ID: $SLURM_JOB_ID"
+echo "Working Directory: $(pwd)"
+echo "main.py exists: $([ -f main.py ] && echo 'YES' || echo 'NO')"
 hostname
 date
 nvidia-smi
 
 # Grid search parameters - keep decoder architecture fixed, vary training settings
 LR_LIST=(3e-4)  
-DEC_LAYERS_LIST=(4)  # Keep fixed at notebook's setting
-MASK_LIST=(0.75)  # Notebook's mask ratio
-NORM_PIX_LOSS_LIST=(true)  # Notebook's setting (false) + alternative (true)
+DEC_LAYERS_LIST=(4)  
+MASK_LIST=(0.75) 
+NORM_PIX_LOSS_LIST=(false)  
 EPOCHS_LIST=(400)
+# Crop augmentation settings: "none" means no cropping, crop scale ranges for data augmentation
+CROP_SETTINGS=("0.5-1.0" "0.7-1.0")
 COMBINATIONS=()
 for LR in "${LR_LIST[@]}"; do
   for DECL in "${DEC_LAYERS_LIST[@]}"; do
       for MASK in "${MASK_LIST[@]}"; do
           for NORM in "${NORM_PIX_LOSS_LIST[@]}"; do
               for EPOCHS in "${EPOCHS_LIST[@]}"; do
-              RN="mae_lr${LR}_decl${DECL}_mask${MASK}_norm${NORM}_$(date +%H%M%S)"
-              cmd="--use_wandb --image_size 256 --epochs $EPOCHS --batch_size 512"  # Changed epochs to 800 (notebook's setting)
-              cmd="$cmd --lr $LR --mask_ratio $MASK --hidden_size 384 --num_layers 12"
-              cmd="$cmd --decoder_hidden_size 256 --decoder_num_layers $DECL --num_samples_pdf 2"  # Fixed decoder size to notebook's setting
-              cmd="$cmd --run_name $RN"
-              if [ "$NORM" = "true" ]; then
-                  cmd="$cmd --norm_pix_loss"
-              fi
-              COMBINATIONS+=("$cmd")
+                  for CROP in "${CROP_SETTINGS[@]}"; do
+                      if [ "$CROP" = "none" ]; then
+                          RN="mae_lr${LR}_decl${DECL}_mask${MASK}_norm${NORM}_nocrop_$(date +%H%M%S)"
+                      else
+                          RN="mae_lr${LR}_decl${DECL}_mask${MASK}_norm${NORM}_crop${CROP}_$(date +%H%M%S)"
+                      fi
+                      cmd="--use_wandb --image_size 256 --epochs $EPOCHS --batch_size 512"
+                      cmd="$cmd --lr $LR --mask_ratio $MASK --hidden_size 384 --num_layers 12"
+                      cmd="$cmd --decoder_hidden_size 256 --decoder_num_layers $DECL --num_samples_pdf 2"
+                      cmd="$cmd --run_name $RN"
+                      if [ "$NORM" = "true" ]; then
+                          cmd="$cmd --norm_pix_loss"
+                      fi
+                      if [ "$CROP" != "none" ]; then
+                          # Parse crop scale range (e.g., "0.2-1.0" -> min=0.2, max=1.0)
+                          CROP_MIN=$(echo $CROP | cut -d'-' -f1)
+                          CROP_MAX=$(echo $CROP | cut -d'-' -f2)
+                          cmd="$cmd --use_random_crop --crop_scale_min $CROP_MIN --crop_scale_max $CROP_MAX"
+                      fi
+                      COMBINATIONS+=("$cmd")
+                  done
               done
           done
       done
