@@ -1,12 +1,23 @@
 # MAE Self-Supervised Learning on Galaxy10-DECALS
 
-This repository implements Masked Autoencoder (MAE) self-supervised learning on the Galaxy10-DECALS dataset using Vision Transformers. The project explores MAE pre-training on astronomical galaxy images and evaluates learned representations through comprehensive linear probing and fine-tuning experiments. Pre-trained encoder can be accessed at https://drive.google.com/file/d/1oQ1woMGIf8wXCsmp_DIrCNTUvR1n6JuM/view?usp=sharing. All experiments are run on Oscar.
+This repository implements Masked Autoencoder (MAE) self-supervised learning on the Galaxy10-DECALS dataset using Vision Transformers. The project explores MAE pre-training on astronomical galaxy images and evaluates learned representations through comprehensive linear probing and fine-tuning experiments. Pre-trained encoder can be accessed at https://drive.google.com/file/d/1X9Lyk1Nqn5TSbjmrb3XOFZmFwPkBBjDB/view?usp=sharing. All experiments are run on Oscar.
 
 ## Results
 
-- **Best Configuration**: 66.23% accuracy with linear probing (no augmentation)
-- **SSL vs Random**: 66.23% (SSL) vs 64.21% (random fine-tuning)
-- **Full Fine-tuning**: 77.51% accuracy with SSL pre-training
+### Comprehensive Evaluation Results
+
+| Method | Accuracy | Gain over Random |
+|--------|----------|------------------|
+| **Zero-shot (Random Init)** | 10.99% | baseline |
+| **Random Init - Linear Probe** | 25.54% | +14.55% |
+| **SSL Pretrained - Linear Probe** | 66.23% | +40.69% |
+| **Random Init - Fine-tune** | 64.21% | +38.67% |
+| **SSL Pretrained - Fine-tune** | 77.51% | +66.52% |
+
+### Key Findings
+- **SSL Pretraining improves Linear Probing by: +40.69%** (2.59x better than random)
+- **SSL Pretraining improves Fine-tuning by: +13.30%**
+- **Best overall method**: SSL Pretrained Fine-tuning at **77.51%**
 - **Optimal Mask Ratio**: 0.75 (tested 0.65-0.90 range)
 
 ## Reconstruction Example
@@ -37,37 +48,52 @@ pip install -r requirements.txt
 
 The Galaxy10-DECALS dataset will be automatically downloaded when running the experiments. It contains 17,736 galaxy images across 10 classes.
 
+## Quick Start
+
+1. **Pre-train MAE model**:
+   ```bash
+   sbatch run_ssl
+   ```
+
+2. **Run comprehensive evaluation**:
+   ```bash
+   sbatch run_linear_probe_array.sh
+   ```
+
 ## Running Experiments
 
 ### 1. MAE Pre-training
 
 ```bash
-# Run grid search for hyperparameter optimization
+# Run pre-training experiments
 sbatch run_ssl
 
 # Or run single experiment
 python main.py \
-    --output_dir ./outputs/mae_experiment \
-    --learning_rate 3e-4 \
-    --decoder_layers 4 \
+    --use_wandb \
+    --lr 3e-4 \
+    --epochs 400 \
+    --batch_size 512 \
     --mask_ratio 0.75 \
-    --normalize_pixel_loss false \
-    --num_train_epochs 100
+    --hidden_size 384 \
+    --num_layers 12 \
+    --decoder_hidden_size 256 \
+    --decoder_num_layers 4
 ```
 
 ### 2. Linear Probing and Evaluation
 
 ```bash
-# Comprehensive evaluation (zero-shot, random fine-tuning, SSL linear probe, SSL fine-tuning)
-sbatch run_linear_probe.sh
+# Run all 4 experiments in parallel (zero-shot, random/SSL × linear probe/fine-tuning)
+sbatch run_linear_probe_array.sh
 
-# Or run directly
+# Or run comprehensive evaluation directly
 python linear_probe_checkpoints.py \
     --comprehensive_eval \
-    --ssl_checkpoint ./outputs/mae_lr3e-4_decl4_mask0.75_normfalse_210133/encoder.pth \
-    --probe_epochs 80 \
+    --ssl_checkpoint ./outputs/mae_lr3e-4_decl4_mask0.75_normfalse_172129/encoder.pth \
+    --probe_epochs 90 \
     --probe_lr 1e-3 \
-    --finetune_epochs 80 \
+    --finetune_epochs 90 \
     --finetune_lr 1e-3 \
     --batch_size 2048
 ```
@@ -80,9 +106,9 @@ If you have your own pre-trained checkpoint:
 python linear_probe_checkpoints.py \
     --comprehensive_eval \
     --ssl_checkpoint /path/to/your/encoder.pth \
-    --probe_epochs 80 \
+    --probe_epochs 90 \
     --probe_lr 1e-3 \
-    --finetune_epochs 80 \
+    --finetune_epochs 90 \
     --finetune_lr 1e-3 \
     --batch_size 2048
 ```
@@ -90,16 +116,17 @@ python linear_probe_checkpoints.py \
 ## Key Files
 
 - `main.py`: MAE pre-training implementation
-- `linear_probe_checkpoints.py`: Comprehensive evaluation pipeline
+- `linear_probe_checkpoints.py`: Comprehensive evaluation pipeline (4 experiments)
 - `run_ssl`: SLURM script for pre-training experiments
-- `run_linear_probe.sh`: SLURM script for evaluation experiments
+- `run_linear_probe_array.sh`: SLURM array script for parallel evaluation (4 jobs)
 
 ## Architecture
 
 - **Model**: Custom ViT with 384 hidden size, 12 layers, 6 attention heads
-- **Pre-training**: No data augmentation (following MAE protocol)
-- **Evaluation**: Linear probing and full fine-tuning with/without augmentation
+- **Pre-training**: MAE self-supervised learning (following original protocol)
+- **Evaluation**: Linear probing and full fine-tuning with comprehensive baselines
 - **Framework**: HuggingFace Transformers with PyTorch
+- **Logging**: Weights & Biases integration for experiment tracking
 
 ## Hyperparameter Search Results
 
@@ -114,16 +141,9 @@ python linear_probe_checkpoints.py \
 
 1. **Mask Ratio Analysis**: Comprehensive search from 0.65 to 0.90
 2. **Pixel Normalization**: Tested Kaiming He's "pixels with normalization" approach
-3. **Data Augmentation**: Compared with/without augmentation during probing
-4. **Baseline Comparison**: Random ViT vs SSL pre-trained models
+3. **Baseline Comparison**: Random ViT vs SSL pre-trained models across 4 evaluation settings
+4. **Training Strategy**: Linear probing vs full fine-tuning comparison
 
-## Requirements
-
-- Python 3.10+
-- PyTorch 2.5.1 with CUDA 12.1
-- HuggingFace Transformers 4.49.0
-- Weights & Biases for experiment tracking
-- SLURM for cluster job management
 
 ## Citation
 
