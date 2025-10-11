@@ -21,14 +21,12 @@ This repository implements Masked Autoencoder (MAE) self-supervised learning on 
 - **Optimal Mask Ratio**: 0.75 (tested 0.65-0.90 range)
 
 ## Reconstruction Example
-- without pixel normalization loss
+-without pixel normalization
 ![MAE reconstruction example](reconstruction_example.png)
-- using pixel normalization loss
+-use pixel normalization
 ![MAE reconstruction example](reconstruction_example2.png)
 
 ## Environment Setup
-
-### Installation
 
 ```bash
 pip install -r requirements.txt
@@ -38,70 +36,26 @@ pip install -r requirements.txt
 
 The Galaxy10-DECALS dataset will be automatically downloaded when running the experiments. It contains 17,736 galaxy images across 10 classes.
 
-## Quick Start
+## Usage
 
-1. **Pre-train MAE model**:
-   ```bash
-   sbatch run_ssl
-   ```
-
-2. **Run comprehensive evaluation**:
-   ```bash
-   sbatch run_linear_probe_array.sh
-   ```
-
-## Running Experiments
-
-### 1. MAE Pre-training
+### Pre-training
 
 ```bash
-# Run pre-training experiments
 sbatch run_ssl
-
-# Or run single experiment
-python main.py \
-    --use_wandb \
-    --lr 3e-4 \
-    --epochs 400 \
-    --batch_size 512 \
-    --mask_ratio 0.75 \
-    --hidden_size 384 \
-    --num_layers 12 \
-    --decoder_hidden_size 256 \
-    --decoder_num_layers 4
 ```
 
-### 2. Linear Probing and Evaluation
+### Evaluation
 
 ```bash
-# Run all 4 experiments in parallel (zero-shot, random/SSL × linear probe/fine-tuning)
 sbatch run_linear_probe_array.sh
-
-# Or run comprehensive evaluation directly
-python linear_probe_checkpoints.py \
-    --comprehensive_eval \
-    --ssl_checkpoint ./outputs/mae_lr3e-4_decl4_mask0.75_normfalse_172129/encoder.pth \
-    --probe_epochs 90 \
-    --probe_lr 1e-3 \
-    --finetune_epochs 90 \
-    --finetune_lr 1e-3 \
-    --batch_size 2048
 ```
 
-### 3. Custom Checkpoint Evaluation
-
-If you have your own pre-trained checkpoint:
-
-```bash
-python linear_probe_checkpoints.py \
-    --comprehensive_eval \
-    --ssl_checkpoint /path/to/your/encoder.pth \
-    --probe_epochs 90 \
-    --probe_lr 1e-3 \
-    --finetune_epochs 90 \
-    --finetune_lr 1e-3 \
-    --batch_size 2048
-```
+This runs 4 experiments in parallel:
+- Zero-shot evaluation (random initialization)
+- Random initialization + Linear Probe
+- SSL pretrained + Linear Probe
+- Random initialization + Fine-tuning
+- SSL pretrained + Fine-tuning
 
 ## Key Files
 
